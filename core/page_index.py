@@ -1,200 +1,261 @@
+"""
+core/page_index.py — Vectorless PageIndex with Hierarchical Tree Indexing
+
+Responsibilities:
+  1. Extract text page-by-page from PDFs using PyMuPDF
+  2. Build an LLM-generated hierarchical tree index (semantic TOC)
+  3. Persist page texts, tree structure, and metadata to disk
+  4. Provide tool-callable functions for the agent:
+     - get_document_metadata()
+     - get_document_structure()
+     - get_page_content(pages)
+"""
+
 import os
 import json
+from datetime import datetime, timezone
+
 import pymupdf
 from groq import Groq
+from tenacity import retry, stop_after_attempt, wait_exponential
+
 from core.config import settings
 
 
 # ──────────────────────────────────────────────
-# Groq Client (singleton — reused across calls)
+# Groq Client
 # ──────────────────────────────────────────────
+_groq_client: Groq | None = None
+
+
 def get_groq_client() -> Groq:
-    return Groq(api_key=settings.GROQ_API_KEY)
+    global _groq_client
+    if _groq_client is None:
+        _groq_client = Groq(api_key=settings.GROQ_API_KEY)
+    return _groq_client
 
 
 # ──────────────────────────────────────────────
-# Step 0: PDF Text Extraction (via PyMuPDF)
+# PDF Text Extraction
 # ──────────────────────────────────────────────
 def extract_text_per_page(pdf_path: str) -> dict:
     """
-    Extracts text from each page of a PDF.
-    Returns: { "1": "page 1 text", "2": "page 2 text", ... }
+    Extracts text from each page of a PDF using PyMuPDF.
+    Returns: {"1": "page 1 text", "2": "page 2 text", ...}
     """
     page_texts = {}
     doc = pymupdf.open(pdf_path)
     for page_num in range(len(doc)):
         page = doc.load_page(page_num)
         text = page.get_text("text").strip()
-        page_texts[str(page_num + 1)] = text if text else "No parseable text on this page."
+        page_texts[str(page_num + 1)] = text if text else "[No parseable text on this page]"
     doc.close()
     return page_texts
 
 
 # ──────────────────────────────────────────────
-# Step 1: Build PageIndex (vectorless)
+# Hierarchical Tree Index Generation
 # ──────────────────────────────────────────────
-def build_index(document_id: str, pdf_path: str) -> tuple[dict, str]:
+@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10))
+def build_tree_structure(page_texts: dict) -> list[dict]:
     """
-    Vectorless PageIndex strategy:
-      - Extract raw text page-by-page using PyMuPDF
-      - Build a lightweight plain-text structural index (first 300 chars per page)
-      - Save both to disk for later retrieval
+    Uses Groq (Llama 3.3 70B) to generate a hierarchical tree index
+    from the extracted page texts. This is the 'smart Table of Contents'
+    that the agent will reason over — far superior to flat 300-char previews.
+
+    Returns a list of tree nodes:
+    [
+      {
+        "title": "Section Name",
+        "summary": "1-2 sentence description of what this section covers",
+        "start_page": 1,
+        "end_page": 3,
+        "children": [ ... nested nodes ... ]
+      }
+    ]
+    """
+    client = get_groq_client()
+
+    # Build a condensed representation for the LLM (first 200 chars per page)
+    page_previews = []
+    for page_num, text in page_texts.items():
+        preview = text[:200].replace("\n", " ").strip()
+        page_previews.append(f"Page {page_num}: {preview}")
+
+    previews_str = "\n".join(page_previews)
+
+    system_prompt = """You are a document structure analyst. Given page previews of a document,
+generate a hierarchical tree structure (like a smart Table of Contents).
+
+RULES:
+- Each node must have: "title", "summary" (1-2 sentences), "start_page" (int), "end_page" (int), "children" (array)
+- Group related pages into logical sections
+- Use nested children for sub-sections where appropriate
+- The summary should describe the LEGAL CONTENT of the section, not just repeat headings
+- Return ONLY a valid JSON array of nodes. No markdown, no explanation."""
+
+    user_prompt = f"""Generate a hierarchical tree structure for this document:
+
+{previews_str}
+
+Return a JSON array of tree nodes."""
+
+    response = client.chat.completions.create(
+        model=settings.GROQ_MODEL,
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ],
+        temperature=0,
+        max_tokens=2048,
+    )
+
+    content = response.choices[0].message.content.strip()
+
+    # Extract JSON array from response
+    if "[" in content:
+        start = content.find("[")
+        end = content.rfind("]") + 1
+        tree = json.loads(content[start:end])
+        return tree
+
+    # Fallback: flat structure if LLM doesn't produce a tree
+    return [
+        {
+            "title": f"Page {p}",
+            "summary": page_texts[p][:150],
+            "start_page": int(p),
+            "end_page": int(p),
+            "children": [],
+        }
+        for p in page_texts
+    ]
+
+
+# ──────────────────────────────────────────────
+# Build Index (called during upload)
+# ──────────────────────────────────────────────
+def build_index(document_id: str, pdf_path: str, filename: str = "") -> tuple[dict, list[dict]]:
+    """
+    Full indexing pipeline:
+      1. Extract text per page (PyMuPDF)
+      2. Generate hierarchical tree index (Groq LLM)
+      3. Save page texts, tree structure, and metadata to disk
+
+    Returns: (page_texts, tree_structure)
     """
     print(f"[PageIndex] Extracting pages from: {pdf_path}")
     page_texts = extract_text_per_page(pdf_path)
     total_pages = len(page_texts)
     print(f"[PageIndex] Found {total_pages} pages.")
 
-    # Build the page index string (Table of Contents snapshot)
-    index_lines = []
-    for page_num, text in page_texts.items():
-        preview = text[:300].replace("\n", " ").strip()
-        index_lines.append(f"Page {page_num}: {preview}...")
+    # Generate hierarchical tree
+    print("[PageIndex] Building hierarchical tree index via LLM...")
+    try:
+        tree_structure = build_tree_structure(page_texts)
+        print(f"[PageIndex] Tree built with {len(tree_structure)} top-level nodes.")
+    except Exception as e:
+        print(f"[PageIndex] Tree generation failed, using flat fallback: {e}")
+        tree_structure = [
+            {
+                "title": f"Page {p}",
+                "summary": page_texts[p][:150],
+                "start_page": int(p),
+                "end_page": int(p),
+                "children": [],
+            }
+            for p in page_texts
+        ]
 
-    index_str = "\n".join(index_lines)
+    # Persist to disk
+    texts_path = os.path.join(settings.UPLOAD_DIR, f"{document_id}.json")
+    tree_path = os.path.join(settings.UPLOAD_DIR, f"{document_id}_tree.json")
+    meta_path = os.path.join(settings.UPLOAD_DIR, f"{document_id}_meta.json")
 
-    # Persist texts and index to disk
-    doc_path = os.path.join(settings.UPLOAD_DIR, f"{document_id}.json")
-    index_path = os.path.join(settings.UPLOAD_DIR, f"{document_id}_index.txt")
-
-    with open(doc_path, "w", encoding="utf-8") as f:
+    with open(texts_path, "w", encoding="utf-8") as f:
         json.dump(page_texts, f)
 
-    with open(index_path, "w", encoding="utf-8") as f:
-        f.write(index_str)
+    with open(tree_path, "w", encoding="utf-8") as f:
+        json.dump(tree_structure, f, indent=2)
 
-    return page_texts, index_str
+    metadata = {
+        "document_id": document_id,
+        "filename": filename or os.path.basename(pdf_path),
+        "total_pages": total_pages,
+        "status": "indexed",
+        "indexed_at": datetime.now(timezone.utc).isoformat(),
+    }
+    with open(meta_path, "w", encoding="utf-8") as f:
+        json.dump(metadata, f, indent=2)
 
-
-# ──────────────────────────────────────────────
-# Step 2: Load from Disk
-# ──────────────────────────────────────────────
-def load_document_data(document_id: str) -> tuple[dict, str]:
-    doc_path = os.path.join(settings.UPLOAD_DIR, f"{document_id}.json")
-    index_path = os.path.join(settings.UPLOAD_DIR, f"{document_id}_index.txt")
-
-    if not os.path.exists(doc_path) or not os.path.exists(index_path):
-        raise FileNotFoundError(f"Document ID '{document_id}' not found. Please upload the document first.")
-
-    with open(doc_path, "r", encoding="utf-8") as f:
-        page_texts = json.load(f)
-
-    with open(index_path, "r", encoding="utf-8") as f:
-        index_str = f.read()
-
-    return page_texts, index_str
+    return page_texts, tree_structure
 
 
 # ──────────────────────────────────────────────
-# Step 3: Router — which pages are relevant?
+# Tool Functions (called by the Agent)
 # ──────────────────────────────────────────────
-def retrieve_pages(query: str, index_str: str) -> list[str]:
+def load_document_metadata(document_id: str) -> dict:
+    """Tool: get_document_metadata — returns doc info (page count, status, filename)."""
+    meta_path = os.path.join(settings.UPLOAD_DIR, f"{document_id}_meta.json")
+    if not os.path.exists(meta_path):
+        raise FileNotFoundError(f"Document '{document_id}' not found.")
+    with open(meta_path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def load_document_structure(document_id: str) -> list[dict]:
+    """Tool: get_document_structure — returns the hierarchical tree index."""
+    tree_path = os.path.join(settings.UPLOAD_DIR, f"{document_id}_tree.json")
+    if not os.path.exists(tree_path):
+        raise FileNotFoundError(f"Document structure for '{document_id}' not found.")
+    with open(tree_path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def load_page_texts(document_id: str) -> dict:
+    """Load all page texts from disk."""
+    texts_path = os.path.join(settings.UPLOAD_DIR, f"{document_id}.json")
+    if not os.path.exists(texts_path):
+        raise FileNotFoundError(f"Document texts for '{document_id}' not found.")
+    with open(texts_path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def parse_page_ranges(pages_str: str) -> list[int]:
     """
-    Groq (Llama 3.1 70B) reads the PageIndex and reasons about
-    which page numbers are most likely to contain the answer.
-    Returns a list of page number strings e.g. ["3", "7", "12"]
+    Parse page range strings like '3-5,8,12-14' into a list of integers.
+    Returns: [3, 4, 5, 8, 12, 13, 14]
     """
-    client = get_groq_client()
-
-    system_prompt = """You are a legal document retrieval assistant using the PageIndex technique.
-You are given a structural index of a document (a summary of each page).
-Your task is to identify which page numbers are most likely to contain the answer to the user's query.
-
-RULES:
-- Return ONLY a raw JSON array of page number strings. Example: ["3", "7", "12"]
-- Do NOT include any explanation, markdown, or extra text — ONLY the JSON array.
-- If no pages are relevant, return an empty array: []
-- Be precise. Prefer fewer, highly relevant pages over many loosely relevant ones."""
-
-    user_prompt = f"""Document PageIndex:
-{index_str}
-
-User Query: {query}
-
-Respond with a JSON array of the most relevant page numbers."""
-
-    try:
-        response = client.chat.completions.create(
-            model=settings.GROQ_MODEL,
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt},
-            ],
-            temperature=0,          # deterministic routing
-            max_tokens=256,         # page list is small
-        )
-        content = response.choices[0].message.content.strip()
-
-        # Safely extract JSON array from the response
-        if "[" in content and "]" in content:
-            start = content.find("[")
-            end = content.rfind("]") + 1
-            return json.loads(content[start:end])
-        return []
-
-    except Exception as e:
-        print(f"[PageIndex] Router error: {e}")
-        return []
+    result = []
+    for part in pages_str.split(","):
+        part = part.strip()
+        if "-" in part:
+            start_str, end_str = part.split("-", 1)
+            start, end = int(start_str.strip()), int(end_str.strip())
+            result.extend(range(start, end + 1))
+        else:
+            result.append(int(part))
+    return sorted(set(result))
 
 
-# ──────────────────────────────────────────────
-# Step 4: Generator — answer from exact pages
-# ──────────────────────────────────────────────
-def generate_answer(query: str, page_texts: dict, relevant_pages: list[str]) -> tuple[str, list[str]]:
+def get_page_content(document_id: str, pages: str) -> str:
     """
-    Groq (Llama 3.1 70B) reads ONLY the content from the retrieved pages
-    and generates a precise, citation-backed legal answer.
-    Enforces the Four Corners Rule — no hallucination from outside the document.
+    Tool: get_page_content — fetches full text of specific pages.
+    Accepts ranges like '3-5,8'. Enforces AGENT_MAX_PAGE_FETCH limit.
     """
-    if not relevant_pages:
-        return "The document does not contain information relevant to your query.", []
+    page_texts = load_page_texts(document_id)
+    page_nums = parse_page_ranges(pages)
 
-    # Build context from only the retrieved pages
-    context = ""
-    valid_pages = []
-    for page in relevant_pages:
-        page_key = str(page)
-        if page_key in page_texts:
-            valid_pages.append(page_key)
-            context += f"\n--- Page {page_key} ---\n{page_texts[page_key]}\n"
+    # Enforce safety limit
+    if len(page_nums) > settings.AGENT_MAX_PAGE_FETCH:
+        page_nums = page_nums[: settings.AGENT_MAX_PAGE_FETCH]
 
-    if not context.strip():
-        return "The document does not contain information relevant to your query.", []
+    result_parts = []
+    for p in page_nums:
+        key = str(p)
+        if key in page_texts:
+            result_parts.append(f"--- Page {p} ---\n{page_texts[key]}")
+        else:
+            result_parts.append(f"--- Page {p} ---\n[Page does not exist]")
 
-    client = get_groq_client()
-
-    system_prompt = """You are a highly accurate legal document assistant.
-
-STRICT RULES — THE FOUR CORNERS RULE:
-1. You MUST answer ONLY using the provided document context below.
-2. Do NOT use any outside legal knowledge, case law, or assumptions.
-3. If the answer is not explicitly present in the context, you MUST respond:
-   "The document does not contain this information."
-4. Always cite the exact page number where you found each piece of information.
-   Example: "According to the document (Page 3), the termination clause states..."
-5. Never fabricate facts, dates, names, or clauses.
-6. Be precise and professional — this is a legal context."""
-
-    user_prompt = f"""Document Context (Retrieved Pages Only):
-{context}
-
-User Query: {query}
-
-Provide a precise, citation-backed answer based solely on the context above."""
-
-    try:
-        response = client.chat.completions.create(
-            model=settings.GROQ_MODEL,
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt},
-            ],
-            temperature=0,          # zero temperature for factual legal answers
-            max_tokens=1024,
-        )
-        answer = response.choices[0].message.content.strip()
-        return answer, valid_pages
-
-    except Exception as e:
-        print(f"[PageIndex] Generator error: {e}")
-        return f"An error occurred while generating the answer: {str(e)}", []
+    return "\n\n".join(result_parts)
