@@ -278,3 +278,76 @@ body {
   0%, 100% { transform: scale(1); opacity: 0.5; }
   50% { transform: scale(1.5); opacity: 1; }
 }
+
+/* ── Agent Tool Trace Panel ── */
+.tool-trace {
+  margin-top: 0.8rem;
+  border-top: 1px solid var(--glass-border);
+  padding-top: 0.6rem;
+}
+
+.tool-trace-toggle {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  background: none;
+  border: none;
+  color: var(--text-muted);
+  font-size: 0.8rem;
+  cursor: pointer;
+  padding: 0.3rem 0;
+  transition: color 0.2s;
+  font-family: 'Inter', sans-serif;
+}
+
+.tool-trace-toggle:hover {
+  color: var(--accent-color);
+}
+
+.tool-trace-list {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+  margin-top: 0.5rem;
+  animation: fadeIn 0.25s ease-in;
+}
+
+.tool-trace-item {
+  background: rgba(0, 0, 0, 0.25);
+  border: 1px solid var(--glass-border);
+  border-radius: 8px;
+  padding: 0.6rem 0.8rem;
+  font-size: 0.78rem;
+}
+
+.tool-trace-header {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  flex-wrap: wrap;
+}
+
+.tool-trace-label {
+  font-weight: 600;
+  font-size: 0.78rem;
+}
+
+.tool-trace-args {
+  font-family: 'Courier New', monospace;
+  font-size: 0.72rem;
+  color: var(--text-muted);
+  background: rgba(255, 255, 255, 0.05);
+  padding: 0.1rem 0.4rem;
+  border-radius: 4px;
+}
+
+.tool-trace-preview {
+  color: var(--text-muted);
+  font-size: 0.72rem;
+  margin-top: 0.3rem;
+  line-height: 1.4;
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-height: 80px;
+  overflow-y: auto;
+}
